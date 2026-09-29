@@ -1,0 +1,558 @@
+"""
+PINN — 2D Dielectric Cylinder Scattering (TM mode)
+================================================================
+Plane wave scattering by a dielectric cylinder with a tunable complex
+refractive index. Unlike the PEC version, the field penetrates the cylinder
+so we need two separate networks:
+
+  net_int  : learns u_int(x,y)   — total field  INSIDE  the cylinder
+  net_scat : learns u_scat(x,y)  — scattered field OUTSIDE the cylinder
+
+PHYSICS
+-------
+Incident field (TM):
+    u_inc = exp(i (k x + k y)) = exp(i k (x cosθ + y sinθ))
+
+PDEs:
+    (∇² + k_int²) u_int  = 0    inside  D  (disk of radius a)
+    (∇² + k_ext²) u_scat = 0    outside D
+
+where
+    k_ext = k                          (real, exterior wavenumber)
+    k_int = (n_re + i n_im) * k        (complex, interior wavenumber)
+
+k_int² = (n_re + i n_im)² k²  is complex:
+    Re(k_int²) = (n_re² - n_im²) k²
+    Im(k_int²) = 2 n_re n_im k²
+
+For a complex k_int², the Helmholtz equation for u_int splits as:
+    ∇²(Re u_int) + Re(k_int²) Re(u_int) - Im(k_int²) Im(u_int) = 0
+    ∇²(Im u_int) + Re(k_int²) Im(u_int) + Im(k_int²) Re(u_int) = 0
+
+For the exterior (k_ext² real):
+    ∇²(Re u_scat) + k² Re(u_scat) = 0
+    ∇²(Im u_scat) + k² Im(u_scat) = 0
+
+BOUNDARY CONDITIONS
+-------------------
+On the cylinder boundary ∂D (outward normal n̂):
+
+  1. Ez continuity (field BC):
+       u_int = u_inc + u_scat
+
+  2. Normal derivative continuity (flux BC, μ_int = μ_ext = 1):
+       ∂u_int/∂n = ∂u_inc/∂n + ∂u_scat/∂n
+
+On the outer domain boundary ∂Ω:
+  Sommerfeld ABC on scattered field:
+       ∂u_scat/∂n - i k u_scat = 0
+
+LOSS TERMS
+----------
+    L_pde_int  : Helmholtz residual for u_int  (inside cylinder)
+    L_pde_scat : Helmholtz residual for u_scat (outside cylinder)
+    L_field    : u_int = u_inc + u_scat        on ∂D
+    L_flux     : ∂u_int/∂n = ∂(u_inc+u_scat)/∂n  on ∂D
+    L_abc      : Sommerfeld on u_scat          on ∂Ω
+
+TUNABLE PARAMETERS
+------------------
+  N_RE : real part of refractive index
+  N_IM : imaginary part (>0 = absorption)
+  a    : cylinder radius
+  k    : exterior wavenumber
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import matplotlib
+from scipy.ndimage import map_coordinates
+import os
+import time
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUNABLE PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+N_RE   = 1.5    # real part of refractive index
+N_IM   = 0.5    # imaginary part  (0 = lossless dielectric, >0 = absorbing)
+k      = 2.0 * np.pi   # exterior wavenumber  (wavelength = 1)
+a      = 0.05           # cylinder radius
+cx, cy = 0.5, 0.5       # cylinder centre
+# Incident wave direction
+theta_inc = -np.pi / 4
+kx = k * np.cos(theta_inc)
+ky = k * np.sin(theta_inc)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Derived wavenumbers
+# ─────────────────────────────────────────────────────────────────────────────
+k_int        = (N_RE + 1j * N_IM) * k
+k_int_sq_re  = float((N_RE**2 - N_IM**2) * k**2)   # Re(k_int²)
+k_int_sq_im  = float(2 * N_RE * N_IM * k**2)        # Im(k_int²)
+k_ext_sq     = k**2                                  # k² exterior (real)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training config
+# ─────────────────────────────────────────────────────────────────────────────
+torch.manual_seed(0)
+np.random.seed(0)
+
+N_INT   = 1000   # interior PDE points  (inside cylinder)
+N_EXT   = 2000   # exterior PDE points  (outside cylinder)
+N_IFACE = 800    # interface boundary ∂D
+N_OUT   = 600    # outer boundary ∂Ω
+
+ADAM_EPOCHS = 1000
+LBFGS_STEPS = 5000
+LR_ADAM     = 8e-4
+
+W_PDE_INT  = 1.0
+W_PDE_EXT  = 1.0
+W_FIELD    = 20.0   # Ez continuity on ∂D
+W_FLUX     = 20.0   # ∂Ez/∂n continuity on ∂D
+W_ABC      = 5.0   # Sommerfeld on ∂Ω
+
+R_ABC = 20.0  # radius for "virtual" circular ABC boundary
+
+N_FOURIER = 32
+HIDDEN    = 3
+NEURONS   = 96
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"  Using device: {DEVICE}")
+ka = k * a
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load FDM reference solution
+# ─────────────────────────────────────────────────────────────────────────────
+FDM_PATH = "inputs/fdm_solution.npz"
+if os.path.exists(FDM_PATH):
+    _fdm = np.load(FDM_PATH)
+    FDM_X        = _fdm["X"]           # shape [N_fdm, N_fdm]
+    FDM_Y        = _fdm["Y"]
+    FDM_Scat_re  = _fdm["U_scat_re"]   # scattered field real part
+    FDM_Scat_im  = _fdm["U_scat_im"]
+    FDM_Int_re   = (_fdm["U_total_re"] # total field inside = interior field
+                    - _fdm["U_inc_re"])
+    FDM_Int_im   = (_fdm["U_total_im"]
+                    - _fdm["U_inc_im"])
+    # Store total field too for convenience
+    FDM_Total_re = _fdm["U_total_re"]
+    FDM_Total_im = _fdm["U_total_im"]
+    FDM_N        = FDM_X.shape[0]
+    USE_FDM_DATA = True
+    print(f"  Loaded FDM reference: {FDM_PATH}  (grid {FDM_N}x{FDM_N})")
+else:
+    USE_FDM_DATA = False
+    print(f"  WARNING: FDM reference not found at {FDM_PATH} — data loss disabled")
+
+# Weight for FDM data loss — set to 0 to disable
+W_DATA_SCAT = 1.0   # scattered field outside cylinder
+W_DATA_INT  = 1.0   # interior field inside cylinder
+
+def interp_fdm(field_grid, xy_torch):
+    """
+    Bilinear interpolation of a 2D FDM field at arbitrary (x,y) points.
+    field_grid : numpy array shape [N_fdm, N_fdm], rows=y, cols=x
+    xy_torch   : torch tensor shape [M, 2], columns = (x, y)
+    Returns    : torch tensor shape [M, 1] on DEVICE
+    """
+    xy_np  = xy_torch.detach().cpu().numpy()
+    x_pts  = xy_np[:, 0]
+    y_pts  = xy_np[:, 1]
+    # Map physical coords [0,1] to pixel coords [0, N_fdm-1]
+    i_coords = y_pts * (FDM_N - 1)   # y → row index
+    j_coords = x_pts * (FDM_N - 1)   # x → col index
+    coords   = np.array([i_coords, j_coords])
+    vals     = map_coordinates(field_grid, coords, order=1, mode='nearest')
+    return torch.tensor(vals.astype(np.float32), device=DEVICE).unsqueeze(1)
+
+print("=" * 60)
+print("Dielectric Cylinder PINN (TM mode, two networks)")
+print("=" * 60)
+print(f"  n            = {N_RE} + {N_IM}i")
+print(f"  k_ext        = {k:.4f}")
+print(f"  k_int        = {k_int:.4f}")
+print(f"  a            = {a},   ka = {ka:.3f}")
+print(f"  Re(k_int²)   = {k_int_sq_re:.4f}")
+print(f"  Im(k_int²)   = {k_int_sq_im:.4f}")
+print("=" * 60)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fourier feature embeddings — one per network, scaled to the relevant k
+# ─────────────────────────────────────────────────────────────────────────────
+torch.manual_seed(1)
+B_ext = torch.randn(2, N_FOURIER, device=DEVICE) * k
+B_int = torch.randn(2, N_FOURIER, device=DEVICE) * abs(k_int)
+
+def embed_ext(xy):
+    proj = xy @ B_ext
+    return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
+
+def embed_int(xy):
+    proj = xy @ B_int
+    return torch.cat([torch.cos(proj), torch.sin(proj)], dim=-1)
+
+IN_DIM = 2 * N_FOURIER
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────────────────────────
+class MLP(nn.Module):
+    """Outputs [Re(u), Im(u)] as two separate scalars."""
+    def __init__(self, embed_fn):
+        super().__init__()
+        self.embed = embed_fn
+        layers = [nn.Linear(IN_DIM, NEURONS), nn.Tanh()]
+        for _ in range(HIDDEN - 1):
+            layers += [nn.Linear(NEURONS, NEURONS), nn.Tanh()]
+        layers += [nn.Linear(NEURONS, 2)]
+        self.net = nn.Sequential(*layers)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, xy):
+        out = self.net(self.embed(xy))
+        return out[:, 0:1], out[:, 1:2]   # Re, Im
+
+net_int  = MLP(embed_int).to(DEVICE)   # total field inside cylinder
+net_scat = MLP(embed_ext).to(DEVICE)   # scattered field outside cylinder
+
+n_int  = sum(p.numel() for p in net_int.parameters())
+n_scat = sum(p.numel() for p in net_scat.parameters())
+print(f"\n  net_int  parameters: {n_int:,}")
+print(f"  net_scat parameters: {n_scat:,}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Incident field  u_inc = exp(ikx)
+# ─────────────────────────────────────────────────────────────────────────────
+# u_inc = exp(i(kx*x + ky*y))
+def u_inc_re(xy):   return torch.cos(kx * xy[:, 0:1] + ky * xy[:, 1:2])
+def u_inc_im(xy):   return torch.sin(kx * xy[:, 0:1] + ky * xy[:, 1:2])
+
+# ∂u_inc/∂n = i(kx nx + ky ny) u_inc
+# Re: -(kx nx + ky ny) sin(kx x + ky y)
+# Im:  (kx nx + ky ny) cos(kx x + ky y)
+def du_inc_dn_re(xy, nxy):
+    phase = kx * xy[:, 0:1] + ky * xy[:, 1:2]
+    kn    = kx * nxy[:, 0:1] + ky * nxy[:, 1:2]
+    return -kn * torch.sin(phase)
+
+def du_inc_dn_im(xy, nxy):
+    phase = kx * xy[:, 0:1] + ky * xy[:, 1:2]
+    kn    = kx * nxy[:, 0:1] + ky * nxy[:, 1:2]
+    return  kn * torch.cos(phase)
+# ─────────────────────────────────────────────────────────────────────────────
+# Autograd helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def laplacian(u, xy):
+    g   = torch.autograd.grad(u.sum(), xy, create_graph=True)[0]
+    uxx = torch.autograd.grad(g[:, 0].sum(), xy, create_graph=True)[0][:, 0:1]
+    uyy = torch.autograd.grad(g[:, 1].sum(), xy, create_graph=True)[0][:, 1:2]
+    return uxx + uyy
+
+def normal_deriv(u, xy, nxy):
+    g = torch.autograd.grad(u.sum(), xy, create_graph=True)[0]
+    return g[:, 0:1] * nxy[:, 0:1] + g[:, 1:2] * nxy[:, 1:2]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collocation samplers
+# ─────────────────────────────────────────────────────────────────────────────
+def sample_inside(n):
+    """Points strictly inside the cylinder."""
+    pts = []
+    while sum(len(p) for p in pts) < n:
+        xy = np.random.rand(n * 6, 2)
+        r2 = (xy[:, 0] - cx)**2 + (xy[:, 1] - cy)**2
+        pts.append(xy[r2 < (a - 0.005)**2])
+    return torch.tensor(np.vstack(pts)[:n].astype(np.float32),
+                        device=DEVICE, requires_grad=True)
+
+def sample_outside(n):
+    """Points strictly outside the cylinder in [0,1]²."""
+    pts = []
+    while sum(len(p) for p in pts) < n:
+        xy = np.random.rand(n * 4, 2)
+        r2 = (xy[:, 0] - cx)**2 + (xy[:, 1] - cy)**2
+        pts.append(xy[r2 > (a + 0.008)**2])
+    return torch.tensor(np.vstack(pts)[:n].astype(np.float32),
+                        device=DEVICE, requires_grad=True)
+
+def sample_interface(n):
+    """Points on cylinder boundary ∂D with outward normals."""
+    theta = np.random.rand(n) * 2 * np.pi
+    x  = cx + a * np.cos(theta);  y  = cy + a * np.sin(theta)
+    nx = np.cos(theta);            ny = np.sin(theta)
+    xy  = torch.tensor(np.stack([x, y], 1).astype(np.float32),
+                       device=DEVICE, requires_grad=True)
+    nxy = torch.tensor(np.stack([nx, ny], 1).astype(np.float32), device=DEVICE)
+    return xy, nxy
+
+def sample_outer(n_per_side, radius = R_ABC):
+    """Points on far-field circle of radius R_ABC, outward normals = radial."""
+    theta = np.linspace(0, 2*np.pi, n_per_side * 4, endpoint=False)
+    # Add small random perturbation so points aren't always identical
+    theta += np.random.rand(len(theta)) * (2*np.pi / (n_per_side * 4))
+    x  = cx + radius * np.cos(theta)
+    y  = cy + radius * np.sin(theta)
+    nx = np.cos(theta)   # outward radial normal
+    ny = np.sin(theta)
+    xy  = torch.tensor(np.stack([x, y], 1).astype(np.float32),
+                       device=DEVICE, requires_grad=True)
+    nxy = torch.tensor(np.stack([nx, ny], 1).astype(np.float32), device=DEVICE)
+    return xy, nxy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss function
+# ─────────────────────────────────────────────────────────────────────────────
+def loss_fn(xy_in, xy_out, xy_if, n_if, xy_ob, n_ob):
+
+    # ── 1. Interior PDE: (∇² + k_int²) u_int = 0
+    # k_int² is complex: splits into coupled real/imag equations
+    # Re: ∇²uR + kR² uR - kI² uI = 0
+    # Im: ∇²uI + kR² uI + kI² uR = 0
+    iR, iI = net_int(xy_in)
+    lapR_in = laplacian(iR, xy_in)
+    lapI_in = laplacian(iI, xy_in)
+    res_in_R = lapR_in + k_int_sq_re * iR - k_int_sq_im * iI
+    res_in_I = lapI_in + k_int_sq_re * iI + k_int_sq_im * iR
+    l_pde_int = (res_in_R**2 + res_in_I**2).mean()
+
+    # ── 2. Exterior PDE: (∇² + k²) u_scat = 0  (k² real)
+    sR, sI = net_scat(xy_out)
+    lapR_ex = laplacian(sR, xy_out)
+    lapI_ex = laplacian(sI, xy_out)
+    res_ex_R = lapR_ex + k_ext_sq * sR
+    res_ex_I = lapI_ex + k_ext_sq * sI
+    l_pde_ext = (res_ex_R**2 + res_ex_I**2).mean()
+
+    # ── 3. Interface: Ez continuity  u_int = u_inc + u_scat  on ∂D
+    iR_if, iI_if   = net_int(xy_if)
+    sR_if, sI_if   = net_scat(xy_if)
+    inc_R_if        = u_inc_re(xy_if)
+    inc_I_if        = u_inc_im(xy_if)
+    l_field = ((iR_if - (sR_if + inc_R_if))**2 +
+               (iI_if - (sI_if + inc_I_if))**2).mean()
+
+    # ── 4. Interface: flux continuity  ∂u_int/∂n = ∂u_scat/∂n + ∂u_inc/∂n  on ∂D
+    dn_iR = normal_deriv(iR_if, xy_if, n_if)
+    dn_iI = normal_deriv(iI_if, xy_if, n_if)
+    dn_sR = normal_deriv(sR_if, xy_if, n_if)
+    dn_sI = normal_deriv(sI_if, xy_if, n_if)
+    dn_incR = du_inc_dn_re(xy_if, n_if)
+    dn_incI = du_inc_dn_im(xy_if, n_if)
+    l_flux = ((dn_iR - (dn_sR + dn_incR))**2 +
+              (dn_iI - (dn_sI + dn_incI))**2).mean()
+
+    # ── 5. Sommerfeld ABC on outer circle: ∂u_scat/∂n - ik u_scat = 0
+    # Re: ∂uR/∂n - k uI = 0
+    # Im: ∂uI/∂n + k uR = 0
+    oR, oI = net_scat(xy_ob)
+    dn_oR  = normal_deriv(oR, xy_ob, n_ob)
+    dn_oI  = normal_deriv(oI, xy_ob, n_ob)
+    l_abc  = ((dn_oR - k * oI)**2 + (dn_oI + k * oR)**2).mean()
+
+    total = (W_PDE_INT * l_pde_int + W_PDE_EXT * l_pde_ext +
+             W_FIELD   * l_field   + W_FLUX    * l_flux    +
+             W_ABC     * l_abc)
+
+    # ── 6. FDM data loss — penalise deviation from reference solution
+    l_data_scat = torch.tensor(0.0, device=DEVICE)
+    l_data_int  = torch.tensor(0.0, device=DEVICE)
+    if USE_FDM_DATA:
+        # Scattered field at exterior points
+        fdm_sR = interp_fdm(FDM_Scat_re, xy_out)
+        fdm_sI = interp_fdm(FDM_Scat_im, xy_out)
+        l_data_scat = ((sR - fdm_sR)**2 + (sI - fdm_sI)**2).mean()
+
+        # Interior field at interior points
+        # FDM u_int = u_total - u_inc  (net_int learns total field inside)
+        fdm_iR = interp_fdm(FDM_Total_re, xy_in)
+        fdm_iI = interp_fdm(FDM_Total_im, xy_in)
+        l_data_int = ((iR - fdm_iR)**2 + (iI - fdm_iI)**2).mean()
+
+        total = total + W_DATA_SCAT * l_data_scat + W_DATA_INT * l_data_int
+
+    return total, l_pde_int, l_pde_ext, l_field, l_flux, l_abc, l_data_scat, l_data_int
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optimiser — trains both networks simultaneously
+# ─────────────────────────────────────────────────────────────────────────────
+all_params = list(net_int.parameters()) + list(net_scat.parameters())
+optimizer  = torch.optim.Adam(all_params, lr=LR_ADAM)
+scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=ADAM_EPOCHS, eta_min=1e-5)
+
+loss_history = []
+hist_pde_int  = []
+hist_pde_ext  = []
+hist_field    = []
+hist_flux     = []
+hist_abc      = []
+hist_data_scat = []
+hist_data_int  = []
+t0 = time.time()
+
+print(f"\n--- Phase 1: Adam ({ADAM_EPOCHS} epochs) ---")
+print(f"{'Ep':>5} | {'Total':>8} | {'PDEin':>8} | {'PDEex':>8} | "
+      f"{'Field':>8} | {'Flux':>8} | {'ABC':>8} | {'DatSc':>8} | {'DatIn':>8} | {'s':>5}")
+print("-" * 95)
+
+for ep in range(1, ADAM_EPOCHS + 1):
+    if ep == 1 or ep % 250 == 0:
+        xy_in           = sample_inside(N_INT)
+        xy_out          = sample_outside(N_EXT)
+        xy_if, n_if     = sample_interface(N_IFACE)
+        xy_ob, n_ob     = sample_outer(N_OUT // 4)
+
+    optimizer.zero_grad()
+    loss, lpi, lpe, lf, lfl, la, lds, ldi = loss_fn(xy_in, xy_out, xy_if, n_if, xy_ob, n_ob)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+    optimizer.step()
+    scheduler.step()
+    loss_history.append(loss.item())
+    hist_pde_int.append(lpi.item())
+    hist_pde_ext.append(lpe.item())
+    hist_field.append(lf.item())
+    hist_flux.append(lfl.item())
+    hist_abc.append(la.item())
+    hist_data_scat.append(lds.item())
+    hist_data_int.append(ldi.item())
+
+    if ep % 250 == 0 or ep == 1:
+        print(f"{ep:>5} | {loss.item():>8.2e} | {lpi.item():>8.2e} | {lpe.item():>8.2e} | "
+              f"{lf.item():>8.2e} | {lfl.item():>8.2e} | {la.item():>8.2e} | "
+              f"{lds.item():>8.2e} | {ldi.item():>8.2e} | "
+              f"{time.time()-t0:>5.1f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2: L-BFGS
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n--- Phase 2: L-BFGS ({LBFGS_STEPS} steps) ---")
+xy_in_lb         = sample_inside(N_INT)
+xy_out_lb        = sample_outside(N_EXT)
+xy_if_lb, nif_lb = sample_interface(N_IFACE)
+xy_ob_lb, nob_lb = sample_outer(N_OUT // 4)
+
+lbfgs      = torch.optim.LBFGS(all_params, lr=0.1, max_iter=20,
+                                 history_size=50, line_search_fn='strong_wolfe')
+step_count = [0]
+
+def closure():
+    lbfgs.zero_grad()
+    loss, lpi, lpe, lf, lfl, la, lds, ldi = loss_fn(
+        xy_in_lb, xy_out_lb, xy_if_lb, nif_lb, xy_ob_lb, nob_lb)
+    loss.backward()
+    step_count[0] += 1
+    loss_history.append(loss.item())
+    hist_pde_int.append(lpi.item())
+    hist_pde_ext.append(lpe.item())
+    hist_field.append(lf.item())
+    hist_flux.append(lfl.item())
+    hist_abc.append(la.item())
+    hist_data_scat.append(lds.item())
+    hist_data_int.append(ldi.item())
+    if step_count[0] % 500 == 0:
+        print(f"  step {step_count[0]:>4} | loss {loss.item():.4e} | "
+              f"Field {lf.item():.2e} | Flux {lfl.item():.2e} | "
+              f"DatSc {lds.item():.2e} | DatIn {ldi.item():.2e} | {time.time()-t0:.1f}s")
+    return loss
+
+for _ in range(LBFGS_STEPS):
+    lbfgs.step(closure)
+    if step_count[0] >= LBFGS_STEPS:
+        break
+
+print(f"\nTotal training time: {time.time()-t0:.1f}s")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate on dense grid
+# ─────────────────────────────────────────────────────────────────────────────
+N_grid = 300
+xg = np.linspace(0, 1, N_grid)
+yg = np.linspace(0, 1, N_grid)
+Xg, Yg = np.meshgrid(xg, yg)
+R2     = (Xg - cx)**2 + (Yg - cy)**2
+in_cyl = R2 <= a**2
+
+xy_ev = torch.tensor(
+    np.stack([Xg.ravel(), Yg.ravel()], axis=1).astype(np.float32), device=DEVICE)
+
+net_int.eval(); net_scat.eval()
+with torch.no_grad():
+    iR_g, iI_g = net_int(xy_ev)
+    sR_g, sI_g = net_scat(xy_ev)
+
+U_int  = (iR_g.cpu().numpy().reshape(N_grid, N_grid) +
+          1j * iI_g.cpu().numpy().reshape(N_grid, N_grid))
+U_scat = (sR_g.cpu().numpy().reshape(N_grid, N_grid) +
+          1j * sI_g.cpu().numpy().reshape(N_grid, N_grid))
+U_inc  = np.exp(1j * (kx * Xg + ky * Yg))
+
+# Composite total field: interior from net_int, exterior from u_inc + u_scat
+U_total = np.where(in_cyl, U_int, U_inc + U_scat)
+
+print(f"\nField check:")
+print(f"  Max |U_total|  = {np.max(np.abs(U_total)):.4f}")
+print(f"  Inside mean|u| = {np.mean(np.abs(U_int[in_cyl])):.4f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot
+# ─────────────────────────────────────────────────────────────────────────────
+matplotlib.rcParams.update({'font.size': 10})
+fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+circle_kw = dict(color='cyan', lw=1.5, fill=False, zorder=5, ls='--')
+
+def panel(ax, data, title, cmap, symmetric):
+    valid = data[np.isfinite(data)]
+    scale = float(np.percentile(np.abs(valid), 98)) if len(valid) else 1.0
+    scale = max(scale, 1e-12)
+    vmin  = -scale if symmetric else 0.0
+    im    = ax.imshow(data, origin='lower', extent=[0,1,0,1],
+                      cmap=cmap, vmin=vmin, vmax=scale, interpolation='bilinear')
+    ax.add_patch(plt.Circle((cx,cy), a, **circle_kw))
+    ax.set_title(title, fontsize=16); ax.set_xlabel("x"); ax.set_ylabel("y")
+    plt.colorbar(im, ax=ax, shrink=0.95)
+
+panel(axes[0,0], U_inc.real,      "Incident    Re(u_inc)",   "RdBu_r", True)
+panel(axes[0,1], U_scat.real,     "Scattered   Re(u_scat)",  "RdBu_r", True)
+panel(axes[0,2], U_total.real,    "Total       Re(u_total)", "RdBu_r", True)
+panel(axes[1,0], np.abs(U_inc),   "Incident    |u_inc|",     "viridis", False)
+panel(axes[1,1], np.abs(U_scat),  "Scattered   |u_scat|",    "hot",    False)
+panel(axes[1,2], np.abs(U_total), "Total       |u_total|",   "inferno", False)
+
+plt.tight_layout()
+os.makedirs("figures/mie_2d", exist_ok=True)
+plt.savefig("figures/mie_2d/dielectric_pinn_fields.png", dpi=150, bbox_inches='tight')
+print("Saved: figures/mie_2d/dielectric_pinn_fields.png")
+
+# Training loss
+fig2, ax2 = plt.subplots(figsize=(11, 5))
+steps = range(len(loss_history))
+ax2.semilogy(steps, loss_history,    color='black',      lw=1.5, label='Total')
+ax2.semilogy(steps, hist_pde_int,    color='royalblue',  lw=0.8, label='PDE int')
+ax2.semilogy(steps, hist_pde_ext,    color='steelblue',  lw=0.8, label='PDE ext')
+ax2.semilogy(steps, hist_field,      color='tomato',     lw=0.8, label='Field BC')
+ax2.semilogy(steps, hist_flux,       color='orange',     lw=0.8, label='Flux BC')
+ax2.semilogy(steps, hist_abc,        color='mediumseagreen', lw=0.8, label='ABC')
+ax2.semilogy(steps, hist_data_scat,  color='mediumpurple',   lw=0.8, label='Data scat')
+ax2.semilogy(steps, hist_data_int,   color='orchid',     lw=0.8, label='Data int')
+ax2.axvline(ADAM_EPOCHS, color='gray', ls='--', lw=1.5,
+            label=f'Adam → L-BFGS (step {ADAM_EPOCHS})')
+ax2.set_xlabel("Optimiser step")
+ax2.set_ylabel("Loss (log scale)")
+ax2.set_title("Dielectric Cylinder PINN — Training Loss by Term")
+ax2.legend(fontsize=8, ncol=2)
+ax2.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig("figures/mie_2d/dielectric_pinn_loss.png", dpi=150, bbox_inches='tight')
+print("Saved: figures/mie_2d/dielectric_pinn_loss.png")
+
+# plt.show()
+print("\nDone.")

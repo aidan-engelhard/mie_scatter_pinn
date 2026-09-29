@@ -1,0 +1,1 @@
+phase,step,relL2,mag_ratio,target_mag,seconds,total,w_pde_int,w_pde_ext,w_pde_sub,w_field,w_flux,w_pml,w_dirichlet,w_data_scat,w_data_int,w_data_sub

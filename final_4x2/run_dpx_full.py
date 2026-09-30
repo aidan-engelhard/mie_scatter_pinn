@@ -30,12 +30,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 import data_experiment as DX
 
 if len(sys.argv) < 2:
-    raise SystemExit("usage: run_dpx_full.py <multiplier> [seed]")
+    raise SystemExit("usage: run_dpx_full.py <multiplier> [seed] [arch]")
 M = float(sys.argv[1])
 SEED = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+ARCH_ARG = sys.argv[3] if len(sys.argv) > 3 else "mlp"
+if ARCH_ARG not in ("mlp", "deeponet"):
+    raise SystemExit(f"arch must be mlp or deeponet, not {ARCH_ARG!r}")
 MTAG = "w" + f"{M:g}".replace(".", "p")
 
-ARM, ARCH = "4x2", "mlp"
+# The architecture comparison belongs in THIS configuration, not in the one
+# with physics only at the solved geometries: that configuration is worse for
+# both architectures, so a margin measured there says little about which
+# architecture suits the problem.
+#
+# A DeepONet here is the narrowed variant -- latent dimension 64 with the
+# branch output normalised -- and not the 256-wide default, because that is the
+# configuration developed for this problem and the better of the two by a wide
+# margin (0.0482 against 0.0757 on the 4x2 arm). Comparing a tuned MLP against
+# an untuned DeepONet would repeat, in reverse, the unfairness this run exists
+# to remove.
+ARCH_EXTRA = {"mlp": {},
+              "deeponet": {"BRANCH_DIM": 64, "BRANCH_NORM": True,
+                           "TRUNK_NORM": False}}[ARCH_ARG]
+
+ARM, ARCH = "4x2", ARCH_ARG
 _, _, models, figs = DX._paths(ARM)
 os.makedirs(models, exist_ok=True)
 os.makedirs(figs, exist_ok=True)
@@ -58,9 +76,10 @@ cfg = {
     "W_PDE_INT": 1.0 * M, "W_PDE_EXT": 1.0 * M, "W_PDE_SUB": 1.0 * M,
     "W_FIELD": 50.0 * M, "W_FLUX": 50.0 * M,
     "W_PML": 0.5 * M, "W_DIRICHLET": 1.0 * M,
+    **ARCH_EXTRA,
 }
 
-print(f"=== DPX on {ARM}, multiplier {M:g}, FULL budget (Adam "
+print(f"=== DPX {ARCH} on {ARM}, multiplier {M:g}, FULL budget (Adam "
       f"{DX.MATCHED_ADAM}, L-BFGS {DX.MATCHED_LBFGS})  ->  W_FIELD/W_FLUX "
       f"{50.0 * M:g}, W_PDE_* {M:g}, W_PML {0.5 * M:g}, W_DATA {DX.W_DATA:g}")
 
